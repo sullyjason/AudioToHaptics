@@ -1,0 +1,259 @@
+// SBShaptics / Wifi_Actuators.html
+
+// Version 0.1
+// 16.12.2025
+
+// Dashboard compatible with Wifi_Actuators.ino
+// Runs on hardware detailed in hardware folder
+
+// Created by Silvan Roth for Dr Jacqueline Borgstedt,
+// SBS Lab, ETH Zürich
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SBS Haptic Actuators</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #eef2f5; padding: 20px; text-align: center; }
+        
+        header { margin-bottom: 30px; }
+        h1 { margin: 0; color: #333; }
+        #status { font-weight: bold; color: #dc3545; font-size: 14px; margin-top: 5px; }
+        #status.connected { color: #28a745; }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .device-card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            /* Ensure the card stretches to fit content but keeps button at bottom */
+            justify-content: space-between; 
+        }
+
+        .card-header {
+            background: #343a40;
+            color: white;
+            padding: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .device-name { font-weight: bold; font-size: 1.1em; }
+        .device-id { font-size: 0.8em; color: #adb5bd; }
+
+        .file-list {
+            padding: 15px;
+            flex-grow: 1; /* Pushes the button down if list is short */
+            min-height: 150px;
+        }
+        
+        .card-stop-btn {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            border-radius: 8px; /* Rounded corners */
+            margin: 0 15px 20px 15px; /* Margin: Top Right Bottom Left */
+            transition: all 0.2s;
+            box-shadow: 0 2px 5px rgba(220, 53, 69, 0.3);
+        }
+        .card-stop-btn:hover { 
+            background: #c82333; 
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(220, 53, 69, 0.4);
+        }
+        .card-stop-btn:active { transform: translateY(0); }
+
+        .loading-text { color: #888; font-style: italic; margin-top: 50px; }
+
+        .file-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 8px 12px;
+            margin-bottom: 8px;
+            border-radius: 6px;
+        }
+        .file-name { font-size: 14px; color: #495057; font-weight: 500; }
+
+        .btn-group { display: flex; gap: 5px; }
+        .icon-btn {
+            border: none;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            cursor: pointer;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.1s;
+        }
+        .icon-btn:active { transform: scale(0.95); }
+        .btn-play { background: #0d6efd; } 
+        .btn-play:hover { background: #0b5ed7; }
+        .btn-loop { background: #fd7e14; } 
+        .btn-loop:hover { background: #e36d0d; }
+
+        .refresh-all { margin-top: 30px; display: inline-block; cursor: pointer; color: #0d6efd; text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>SBS Haptic Actuators</h1>
+    <div id="status">Disconnected</div>
+</header>
+
+<div id="dashboard" class="dashboard-grid"></div>
+
+<div class="refresh-all" onclick="requestAllFiles()">Refresh All Device Lists</div>
+
+<script>
+    // --- USER CONFIGURATION ---
+    const devices = [
+        { name: "Tentacle 1",  baseTopic: "SBShaptics/1" },
+        { name: "Tentacle 2", baseTopic: "SBShaptics/2" },
+        { name: "Tentacle 3", baseTopic: "SBShaptics/3" },
+        { name: "Tentacle 4",  baseTopic: "SBShaptics/4" },
+        { name: "Tentacle 5", baseTopic: "SBShaptics/5" },
+        { name: "Tentacle 6", baseTopic: "SBShaptics/6" },
+
+    ];
+
+    const mqtt_server = "broker.emqx.io";
+    const mqtt_port = 8083; // EMQX uses 8083 for WebSockets (browser)
+    const clientID = "TitanWeb-" + Math.floor(Math.random() * 100000);
+    const client = new Paho.MQTT.Client(mqtt_server, mqtt_port, clientID);
+
+    function initDashboard() {
+        const container = document.getElementById('dashboard');
+        
+        devices.forEach(device => {
+            const card = document.createElement('div');
+            card.className = 'device-card';
+            const safeId = device.baseTopic.replace(/\//g, '-');
+            
+            // MOVED BUTTON TO BOTTOM
+            card.innerHTML = `
+                <div class="card-header">
+                    <span class="device-name"><i class="fas fa-microchip"></i> ${device.name}</span>
+                    <span class="device-id">${device.baseTopic}</span>
+                </div>
+                
+                <div id="list-${safeId}" class="file-list">
+                    <div class="loading-text">Waiting for device...</div>
+                </div>
+
+                <button class="card-stop-btn" onclick="sendCommand('${device.baseTopic}', 'stop')">
+                    <i class="fas fa-stop-circle"></i> STOP AUDIO
+                </button>
+            `;
+            container.appendChild(card);
+        });
+    }
+
+    client.onConnectionLost = (resp) => {
+        console.log("Lost connection", resp);
+        const el = document.getElementById("status");
+        el.innerText = "Disconnected";
+        el.className = "";
+    };
+
+    client.onMessageArrived = (msg) => {
+        const topic = msg.destinationName;
+        const payload = msg.payloadString;
+        const device = devices.find(d => topic.includes(d.baseTopic));
+        
+        if (device && topic.endsWith("/files")) {
+            renderFileList(device, payload);
+        }
+    };
+
+    client.connect({
+        onSuccess: () => {
+            console.log("Connected");
+            const el = document.getElementById("status");
+            el.innerText = "Connected";
+            el.className = "connected";
+
+            devices.forEach(d => {
+                client.subscribe(d.baseTopic + "/files");
+            });
+            setTimeout(requestAllFiles, 1000);
+        },
+        onFailure: (e) => { console.log("Connect failed", e); }
+    });
+
+    function requestAllFiles() {
+        devices.forEach(d => {
+            sendCommand(d.baseTopic, "list");
+            const safeId = d.baseTopic.replace(/\//g, '-');
+            const listDiv = document.getElementById(`list-${safeId}`);
+            if(listDiv) listDiv.innerHTML = '<div class="loading-text">Refreshing...</div>';
+        });
+    }
+
+    function renderFileList(device, csv) {
+        const safeId = device.baseTopic.replace(/\//g, '-');
+        const listDiv = document.getElementById(`list-${safeId}`);
+        listDiv.innerHTML = ""; 
+
+        if (!csv) {
+            listDiv.innerHTML = '<p style="color:#888">No files found.</p>';
+            return;
+        }
+
+        const files = csv.split(",");
+        files.forEach(file => {
+            const row = document.createElement('div');
+            row.className = 'file-row';
+            row.innerHTML = `
+                <span class="file-name">${file}</span>
+                <div class="btn-group">
+                    <button class="icon-btn btn-play" title="Play Once" onclick="sendCommand('${device.baseTopic}', '${file}')">
+                        <i class="fas fa-play"></i>
+                    </button>
+                    <button class="icon-btn btn-loop" title="Loop" onclick="sendCommand('${device.baseTopic}', 'loop:${file}')">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+                </div>
+            `;
+            listDiv.appendChild(row);
+        });
+    }
+
+    function sendCommand(topic, msg) {
+        if (!client.isConnected()) return;
+        const message = new Paho.MQTT.Message(msg);
+        message.destinationName = topic;
+        client.send(message);
+    }
+
+    initDashboard();
+
+</script>
+
+</body>
+</html>
