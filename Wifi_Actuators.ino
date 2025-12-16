@@ -1,3 +1,30 @@
+/* 
+
+Version 0.1
+16.12.2025
+
+SBS HAPTICS / Wifi_Actuators.ino
+
+Compatible with Wifi_Actuators.html
+
+Compatible with Seeed Studios Xiao ESP32S3 and Adafruit Audio BFF
+https://learn.adafruit.com/adafruit-audio-bff
+
+See hardware folder for details
+
+-----
+
+Created in 2025 by Silvan Jason Roth for
+
+Dr Jacqueline Borgstedt
+SBS Lab, ETH Zürich
+
+sbs.ethz.ch/people/postdocs/jacqueline-borgstedt.html
+silvanjason.me/
+
+*/
+
+
 #include <Arduino.h>
 #include <SD.h>
 #include <SPI.h>
