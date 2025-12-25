@@ -31,8 +31,8 @@ silvanjason.me/
 #include "driver/i2s.h"
 
 // --- USER CONFIGURATION ---
-const char* ssid        = "SSID";           // Wifi Name
-const char* password    = "PASSWORD";       // Wifi password
+const char* ssid        = "Sully";           // Wifi Name
+const char* password    = "1234567890";       // Wifi password
 const char* mqtt_server = "broker.emqx.io"; 
 // Topics are specific to Device 1. Change these for Device 2, 3, etc.
 const char* mqtt_topic_sub  = "SBShaptics/2";       
@@ -346,93 +346,108 @@ void checkSerialCommand() {
 // SETUP
 // ================================================================
 void setup() {
-    // Basic init
+    // 1. Basic Pin Setup
     pinMode(STATUS_LED, OUTPUT); 
-    digitalWrite(STATUS_LED, HIGH); // On
+    digitalWrite(STATUS_LED, HIGH); // Turn LED on initially
     Serial.begin(115200);
     
-    // Ensure WiFi radio doesn't sleep (improves responsiveness)
+    // Ensure WiFi radio doesn't sleep to maintain low latency
     WiFi.setSleep(false);
 
-    // Wait for Serial Monitor to be ready (prevents missed messages on boot)
-    while(!Serial) { delay(10); }
+    // We wait for the Serial Monitor (USB) to connect, but only for 2 seconds.
+    // If no computer connects within 2s, we assume the device is plugged into
+    // a wall outlet or battery, and we proceed automatically.
+    unsigned long serialStart = millis();
+    while(!Serial && (millis() - serialStart < 2000)) { 
+        delay(10); 
+    }
 
-    // Generate a random ID for MQTT (prevents conflicts if you have multiple devices)
+    // Generate a unique ID for MQTT (Titan-XXXX)
     deviceID = "Titan-" + String(random(0xffff), HEX);
 
     Serial.println("\n\n=== SBS HAPTIC ACTUATOR START ===");
     
-    // 1. Setup Hardware (Common to both modes)
+    // 2. Hardware Initialization
+    // A. SD Card
     pinMode(SD_CS, OUTPUT);
     if (!SD.begin(SD_CS)) {
-        Serial.println("SD MOUNT FAILED! Halting.");
-        // Fatal error: Trap in infinite loop
+        Serial.println("SD MOUNT FAILED! Halting system.");
+        // If SD fails, flash LED forever (Fatal Error)
         while(1) { flashLED(1); delay(100); }
     }
     Serial.println("SD Mounted - OK.");
     
+    // B. I2S Audio Driver
     setupI2S();
     Serial.println("I2S Driver - OK.");
 
-    // List files immediately for diagnostics
+    // C. List files (Diagnostic)
     File root = SD.open("/");
     listWavFilesSerial(root);
     root.close();
 
-    // 2. MODE SELECTION (The "Hybrid" Logic)
+    // 3. MODE SELECTION WINDOW
+    // We give the user 3 seconds to press a key.
+    // - If key pressed: Enter MANUAL Mode (USB control).
+    // - If timeout: Enter WIFI Mode (MQTT control).
     Serial.println("\n\n*** PRESS ANY KEY NOW FOR MANUAL MODE ***");
     Serial.println("\n... Waiting 3 seconds ...\n");
     
     unsigned long startWait = millis();
-    // Loop for 3 seconds listening for ANY keypress on Serial
+    bool userInterrupted = false;
+    
     while (millis() - startWait < 3000) {
         if (Serial.available()) {
-            // If user typed something, clear the buffer
+            // User pressed a key! Clear the buffer and flag the interruption.
             while(Serial.available()) Serial.read(); 
-            // Activate Manual Mode
-            manualMode = true;
-            flashLED(5); // Acknowledge with blinks
+            userInterrupted = true;
             break;
         }
         delay(10);
     }
 
-    if (manualMode) {
-        Serial.println("\n#######################################");
-        Serial.println("#                                     #");
+    // 4. ROUTE TO SELECTED MODE
+    if (userInterrupted) {
+        // --- OPTION A: MANUAL MODE ---
+        manualMode = true;
+        flashLED(5); // Visual confirmation
+        Serial.println("\n#####################################");
         Serial.println("#   MANUAL MODE ACTIVE                #");
-        Serial.println("#                                     #");
-        Serial.println("#   - Type 'filename' to play         #");
-        Serial.println("#   - 'loop:filename' to loop         #");
-        Serial.println("#   - 'vol:50' to set volume to 50%.  #");
-        Serial.println("#   - 'stop' to control.              #");
-        Serial.println("#                                     #");  
+        Serial.println("#   - 'filename.wav' to play          #");
+        Serial.println("#   - 'loop:filename.wav' to loop     #");
+        Serial.println("#   - 'vol:50' to set volume          #");
+        Serial.println("#   - 'stop' to stop                  #");
+        Serial.println("#   - 'reset' to reboot               #");
         Serial.println("#######################################\n");
-    }else {
-        // --- WIFI MODE (MQTT) ---
-        Serial.println(">> Continuing to WiFi Mode...");
+    } else {
+        // --- OPTION B: WIFI MODE ---
+        Serial.println(">> No input detected. Starting WiFi Mode...");
+        manualMode = false;
+        
         Serial.print("Connecting to "); Serial.println(ssid);
         WiFi.begin(ssid, password);
         
+        // Wait up to 10 seconds (20 * 500ms) for WiFi
         int retries = 0;
-        // Wait for WiFi connection (up to 10 seconds)
         while (WiFi.status() != WL_CONNECTED && retries < 20) {
             delay(500); Serial.print("."); retries++;
         }
         
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.println(" WiFi Connected.");
+            // WiFi Success
+            Serial.println("\nWiFi Connected.");
             Serial.print("IP: "); Serial.println(WiFi.localIP());
+            Serial.println("(NOTE: Type 'menu' or 'reset' here to reboot into Manual Mode)");
             
             // Configure MQTT
             client.setServer(mqtt_server, 1883);
-            client.setCallback(callback); // Register the callback function
+            client.setCallback(callback);
             client.setKeepAlive(15); 
             client.setSocketTimeout(15);
         } else {
-            // Failover: If WiFi fails, default back to Manual Mode
+            // WiFi Failure -> Fallback to Manual Mode
             Serial.println("\nWiFi Failed. Switching to manual mode.");
-            manualMode = true; 
+            manualMode = true;
         }
     }
 }
@@ -441,15 +456,28 @@ void setup() {
 // MAIN LOOP
 // ================================================================
 void loop() {
-    // --- 1. CONTROL LOGIC ---
+    
+    // --- SECTION 1: COMMUNICATIONS & CONTROL ---
+    
     if (manualMode) {
-        // Only listen to USB Serial
-        checkSerialCommand();
+        // [A] MANUAL MODE BEHAVIOR
+        // We strictly ignore MQTT. We only listen to the USB Serial port.
+        if (Serial.available()) {
+            String cmd = Serial.readStringUntil('\n');
+            cmd.trim();
+            
+            // Check for reboot command
+            if(cmd == "reset" || cmd == "reboot") ESP.restart(); 
+            
+            // Otherwise, process audio command
+            parseCommand(cmd);
+        }
     } else {
-        // WiFi Mode: Maintain MQTT connection
+        // [B] WIFI MODE BEHAVIOR
+        // 1. Maintain MQTT Connection
         if (!client.connected()) {
             static unsigned long lastReconnect = 0;
-            // Non-blocking reconnect timer (every 5 seconds)
+            // Try to reconnect every 5 seconds if connection drops
             if (millis() - lastReconnect > 5000) {
                 reconnect();
                 lastReconnect = millis();
@@ -458,41 +486,57 @@ void loop() {
             // Process incoming MQTT messages
             client.loop();
         }
+
+        // 2. Hot-Plug Listener (The "Emergency Exit")
+        // Even when running on WiFi, we listen to Serial. 
+        // If a user plugs in a laptop and types "menu", we reboot to give them control.
+        if (Serial.available()) {
+            String input = Serial.readStringUntil('\n');
+            input.trim();
+            if (input == "menu" || input == "reset") {
+                Serial.println("\nCommand received. Rebooting to Diagnostics/Manual Menu...");
+                delay(500);
+                ESP.restart(); // Soft Restart
+            }
+        }
     }
 
-    // --- 2. AUDIO PLAYBACK LOGIC ---
+    // --- SECTION 2: HIGH PRIORITY AUDIO ENGINE ---
+    
     if (isPlaying) {
         if (audioFile.available()) {
-            // Step A: Read raw bytes from SD card into buffer
+            // 1. Read Raw Data
+            // Read a chunk of bytes from the SD card into our buffer
             size_t bytes_read = audioFile.read(i2s_buffer, sizeof(i2s_buffer));
             
-            // Step B: SOFTWARE VOLUME CONTROL
-            // To change volume, we must multiply every sample by a float (0.0 to 1.0).
-            // We cast the buffer to int16_t because audio samples are 16-bit signed integers.
+            // 2. Software Volume Processing
+            // We cast the buffer to 16-bit integers to manipulate audio samples
             int16_t* samples = (int16_t*)i2s_buffer;
-            int sampleCount = bytes_read / 2; // 2 bytes per sample (16-bit)
+            int sampleCount = bytes_read / 2; // 16-bit = 2 bytes per sample
 
             for (int i = 0; i < sampleCount; i++) {
-                // Apply volume scaling
+                // Scale the audio sample by the volume float (0.0 to 1.0)
                 samples[i] = (int16_t)(samples[i] * masterVolume);
             }
 
-            // Step C: Send processed audio to I2S hardware
+            // 3. Send to Hardware
+            // Push the processed buffer to the I2S amplifier
             size_t bytes_written;
             i2s_write(I2S_NUM_0, i2s_buffer, bytes_read, &bytes_written, 0); 
             
         } else {
-            // End of file reached
+            // End of File (EOF) Reached
             if (shouldLoop) {
-                // If looping, jump back to start (skipping header again)
+                // If looping is active, jump back to byte 44 (skipping the WAV header)
                 audioFile.seek(44); 
             } else {
-                // Otherwise, stop cleanly
+                // If not looping, stop playback cleanly
                 stopPlayback();
             }
         }
     } else {
-        // If not playing, small delay to prevent CPU hogging
+        // If audio is idle, add a tiny delay to prevent the CPU from running hot
+        // This keeps the ESP32 cool and stable.
         delay(10); 
     }
 }
