@@ -1,6 +1,6 @@
 /*
 SBS Haptic Actuator Firmware 
-v0.1.0
+v0.2.0 - Robust SD & Non-Blocking Boot
 
 Compatible with Actuator_Dashboard.html v0.1.0
 
@@ -11,16 +11,11 @@ See hardware folder for details
 Capabilities:
  * 1. Hybrid Control: Works over WiFi (MQTT) OR USB (Serial).
  * 2. Audio Playback: Plays .wav files from SD card via I2S.
- * 3. Features: Volume control, Looping, Remote file listing.
+ * 3. Robust Boot: Retries SD card mounting and reports errors to dashboard without crashing.
 
 -----
 Created in 2025 by Silvan Jason Roth for Dr Jacqueline Borgstedt, SBS Lab, ETH Zürich
-
-sbs.ethz.ch/people/postdocs/jacqueline-borgstedt.html
-silvanjason.me/
-
 */
-
 
 // --- LIBRARIES ---
 #include <Arduino.h>
@@ -31,16 +26,15 @@ silvanjason.me/
 #include "driver/i2s.h"
 
 // --- USER CONFIGURATION ---
-const char* ssid        = "Sully";           // Wifi Name
-const char* password    = "1234567890";       // Wifi password
+const char* ssid        = "SSID";           // Wifi Name
+const char* password    = "PASSWORD";       // Wifi password
 const char* mqtt_server = "broker.emqx.io"; 
 // Topics are specific to Device 1. Change these for Device 2, 3, etc.
-const char* mqtt_topic_sub  = "SBShaptics/2";       
-const char* mqtt_topic_pub  = "SBShaptics/2/files"; 
+const char* mqtt_topic_sub  = "SBShaptics/1";       
+const char* mqtt_topic_pub  = "SBShaptics/1/files"; 
 
 // --- PIN DEFINITION ---
-// Specific to Adafruit SD Card/Amp "BFF", see Hardware folder for details. Change if using other hardware
-// SD Card Pins (Standard SPI)
+// Specific to Adafruit SD Card/Amp "BFF". Change if using other hardware.
 #define SD_CS      1        // Chip Select for SD Card
 
 // I2S Audio Pins
@@ -52,6 +46,7 @@ const char* mqtt_topic_pub  = "SBShaptics/2/files";
 
 // Audio Configuration
 #define SAMPLE_RATE 44100   // Standard CD quality audio sample rate
+
 // --- GLOBAL OBJECTS ---
 WiFiClient espClient;           // TCP Network Client
 PubSubClient client(espClient); // MQTT Client wrapper
@@ -61,6 +56,7 @@ File audioFile;                 // Handle for the currently open .wav file
 bool isPlaying = false;         // Flag: Is audio currently running?
 bool shouldLoop = false;        // Flag: Should we restart the file when it ends?
 bool manualMode = false;        // Flag: True = USB control, False = WiFi/MQTT control
+bool sdAvailable = false;       // Tracks if SD is working or not
 uint8_t i2s_buffer[1024];       // Buffer to hold audio data chunk before sending to I2S
 String deviceID;                // Unique ID generated at startup
 float masterVolume = 1.0;       // Volume multiplier (0.0 to 1.0)
@@ -83,6 +79,10 @@ void flashLED(int times) {
  * Filters out hidden files (start with ._) and non-WAV files.
  */
 void listWavFilesSerial(File dir) {
+    if (!sdAvailable) {
+        Serial.println("Warning: Cannot list files. SD Card not available.");
+        return;
+    }
     Serial.println("------ SD CARD FILES ------");
     dir.rewindDirectory(); // Go back to start of directory
     while (true) {
@@ -108,11 +108,22 @@ void listWavFilesSerial(File dir) {
 
 /**
  * Helper: Publish file list to MQTT
- * reads SD card, creates a CSV string (file1.wav,file2.wav), and sends it to broker.
+ * reads SD card, creates a CSV string (file1.wav,file2.wav), and sends it to broker, Reports error string if SD card is missing.
  */
 void publishFileListMQTT() {
+    // If SD is missing, report the error to the dashboard
+    if (!sdAvailable) {
+        client.publish(mqtt_topic_pub, "ERROR: NO SD CARD MOUNTED");
+        return;
+    }
+
     String fileList = "";
     File root = SD.open("/");
+    if(!root) {
+        client.publish(mqtt_topic_pub, "ERROR: SD READ FAIL");
+        return;
+    }
+    
     root.rewindDirectory();
     while (true) {
         File entry = root.openNextFile();
@@ -181,7 +192,8 @@ void stopPlayback() {
         i2s_write(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytes_written, portMAX_DELAY);
         i2s_zero_dma_buffer(I2S_NUM_0);
         
-        audioFile.close();
+        if (sdAvailable) audioFile.close();
+        
         isPlaying = false; 
         shouldLoop = false; 
         Serial.println("Playback finished/stopped.");
@@ -193,6 +205,13 @@ void stopPlayback() {
  * Opens file, skips header, and sets flags.
  */
 void startPlayback(const char* filename, bool loopMode) {
+    // 1. Guard Clause: Check SD Status
+    if (!sdAvailable) {
+        Serial.println("ERROR: Cannot play. No SD Card.");
+        flashLED(5); // Fast error blink to indicate hardware failure
+        return;
+    }
+
     if (isPlaying) audioFile.close(); // Safety: Close any currently running file
     
     // Check if the command was actually to STOP
@@ -213,7 +232,6 @@ void startPlayback(const char* filename, bool loopMode) {
     
     // IMPORTANT: Skip the first 44 bytes of a WAV file.
     // These bytes contain header info (metadata), not audio data. 
-    // Playing them sounds like a loud static "pop".
     audioFile.seek(44); 
     
     isPlaying = true;
@@ -228,6 +246,10 @@ void startPlayback(const char* filename, bool loopMode) {
  * Used specifically for the Web Serial API (USB Mode)
  */
 void sendFileListSerial() {
+    if (!sdAvailable) {
+        Serial.println("FILES:ERROR_NO_SD");
+        return;
+    }
     String fileList = "";
     File root = SD.open("/");
     root.rewindDirectory();
@@ -271,10 +293,8 @@ void parseCommand(String message) {
 
     // 2. List Handler
     if (message == "list") {
-        sendFileListSerial(); // Always send to Serial (Web interface needs this even in hybrid mode)
-        if(!manualMode) {
-             publishFileListMQTT(); // Only publish to MQTT if we are online
-        }
+        sendFileListSerial(); // Always send to Serial
+        if(!manualMode) publishFileListMQTT(); // Only publish to MQTT if we are online
         return;
     }
 
@@ -324,6 +344,15 @@ void reconnect() {
             Serial.println("CONNECTED!");
             // Resubscribe to topic
             client.subscribe(mqtt_topic_sub);
+            
+            // Publish status immediately on connect
+            if(sdAvailable) {
+                // Publish file list automatically so dashboard updates
+                publishFileListMQTT();
+            } else {
+                client.publish(mqtt_topic_pub, "ERROR: NO SD CARD");
+            }
+            
             flashLED(3);
         } else {
             Serial.print("Failed rc="); Serial.println(client.state());
@@ -331,65 +360,67 @@ void reconnect() {
     }
 }
 
-/**
- * Serial Input Handler
- * Checks if data is coming via USB cable.
- */
-void checkSerialCommand() {
-    if (Serial.available()) {
-        String cmd = Serial.readStringUntil('\n'); // Read until newline
-        parseCommand(cmd); // Pass to the common parser
-    }
-}
-
 // ================================================================
 // SETUP
 // ================================================================
 void setup() {
-    // 1. Basic Pin Setup
-    pinMode(STATUS_LED, OUTPUT); 
-    digitalWrite(STATUS_LED, HIGH); // Turn LED on initially
+    pinMode(STATUS_LED, OUTPUT); digitalWrite(STATUS_LED, HIGH);
     Serial.begin(115200);
     
-    // Ensure WiFi radio doesn't sleep to maintain low latency
     WiFi.setSleep(false);
 
-    // We wait for the Serial Monitor (USB) to connect, but only for 2 seconds.
-    // If no computer connects within 2s, we assume the device is plugged into
-    // a wall outlet or battery, and we proceed automatically.
+    // --- FIX 1: TIMEOUT FOR SERIAL ---
+    // Instead of waiting forever, wait max 2000ms.
+    // This allows the device to boot if plugged into a wall/battery.
     unsigned long serialStart = millis();
     while(!Serial && (millis() - serialStart < 2000)) { 
         delay(10); 
     }
 
-    // Generate a unique ID for MQTT (Titan-XXXX)
     deviceID = "Titan-" + String(random(0xffff), HEX);
 
     Serial.println("\n\n=== SBS HAPTIC ACTUATOR START ===");
     
-    // 2. Hardware Initialization
-    // A. SD Card
+    // --- 2. ROBUST SD CARD MOUNTING ---
+    // We try 3 times to mount the SD card before proceeding.
     pinMode(SD_CS, OUTPUT);
-    if (!SD.begin(SD_CS)) {
-        Serial.println("SD MOUNT FAILED! Halting system.");
-        // If SD fails, flash LED forever (Fatal Error)
-        while(1) { flashLED(1); delay(100); }
-    }
-    Serial.println("SD Mounted - OK.");
+    digitalWrite(SD_CS, HIGH); // Ensure CS is high (deselected) to reset state
     
-    // B. I2S Audio Driver
+    int sdRetries = 0;
+    sdAvailable = false;
+    
+    while(sdRetries < 3) {
+        Serial.print("Mounting SD (Attempt "); Serial.print(sdRetries+1); Serial.print(")... ");
+        
+        // Try mounting at 4MHz (safer speed for older cards)
+        if (SD.begin(SD_CS, SPI, 4000000)) {
+            Serial.println("SUCCESS.");
+            sdAvailable = true;
+            break; // Exit loop on success
+        } else {
+            Serial.println("FAILED.");
+            sdRetries++;
+            digitalWrite(SD_CS, HIGH); // Reset pin
+            delay(100); // Wait a bit before retrying
+        }
+    }
+
+    if (!sdAvailable) {
+        Serial.println("WARNING: Could not mount SD Card. Proceeding without SD Card");
+        // Flash LED to warn user locally
+        flashLED(10);
+    }
+    
     setupI2S();
     Serial.println("I2S Driver - OK.");
 
-    // C. List files (Diagnostic)
-    File root = SD.open("/");
-    listWavFilesSerial(root);
-    root.close();
+    if (sdAvailable) {
+        File root = SD.open("/");
+        listWavFilesSerial(root);
+        root.close();
+    }
 
-    // 3. MODE SELECTION WINDOW
-    // We give the user 3 seconds to press a key.
-    // - If key pressed: Enter MANUAL Mode (USB control).
-    // - If timeout: Enter WIFI Mode (MQTT control).
+    // 3. MODE SELECTION
     Serial.println("\n\n*** PRESS ANY KEY NOW FOR MANUAL MODE ***");
     Serial.println("\n... Waiting 3 seconds ...\n");
     
@@ -398,21 +429,19 @@ void setup() {
     
     while (millis() - startWait < 3000) {
         if (Serial.available()) {
-            // User pressed a key! Clear the buffer and flag the interruption.
-            while(Serial.available()) Serial.read(); 
+            while(Serial.available()) Serial.read(); // Clear buffer
             userInterrupted = true;
             break;
         }
         delay(10);
     }
 
-    // 4. ROUTE TO SELECTED MODE
     if (userInterrupted) {
-        // --- OPTION A: MANUAL MODE ---
         manualMode = true;
-        flashLED(5); // Visual confirmation
+        flashLED(5);
         Serial.println("\n#####################################");
         Serial.println("#   MANUAL MODE ACTIVE                #");
+        if(!sdAvailable) Serial.println("#   WARNING: SD CARD FAILED/MISSING   #");
         Serial.println("#   - 'filename.wav' to play          #");
         Serial.println("#   - 'loop:filename.wav' to loop     #");
         Serial.println("#   - 'vol:50' to set volume          #");
@@ -420,32 +449,27 @@ void setup() {
         Serial.println("#   - 'reset' to reboot               #");
         Serial.println("#######################################\n");
     } else {
-        // --- OPTION B: WIFI MODE ---
+        // 4. WiFi Setup
         Serial.println(">> No input detected. Starting WiFi Mode...");
         manualMode = false;
         
         Serial.print("Connecting to "); Serial.println(ssid);
         WiFi.begin(ssid, password);
         
-        // Wait up to 10 seconds (20 * 500ms) for WiFi
         int retries = 0;
         while (WiFi.status() != WL_CONNECTED && retries < 20) {
             delay(500); Serial.print("."); retries++;
         }
         
         if (WiFi.status() == WL_CONNECTED) {
-            // WiFi Success
             Serial.println("\nWiFi Connected.");
             Serial.print("IP: "); Serial.println(WiFi.localIP());
-            Serial.println("(NOTE: Type 'menu' or 'reset' here to reboot into Manual Mode)");
-            
-            // Configure MQTT
+            Serial.println("(Type 'menu' or 'reset' here to reboot into Manual Mode)");
             client.setServer(mqtt_server, 1883);
             client.setCallback(callback);
             client.setKeepAlive(15); 
             client.setSocketTimeout(15);
         } else {
-            // WiFi Failure -> Fallback to Manual Mode
             Serial.println("\nWiFi Failed. Switching to manual mode.");
             manualMode = true;
         }
@@ -456,40 +480,30 @@ void setup() {
 // MAIN LOOP
 // ================================================================
 void loop() {
-    
-    // --- SECTION 1: COMMUNICATIONS & CONTROL ---
-    
+    // --- 1. CONTROL LOGIC ---
     if (manualMode) {
-        // [A] MANUAL MODE BEHAVIOR
-        // We strictly ignore MQTT. We only listen to the USB Serial port.
+        // Only listen to USB Serial
         if (Serial.available()) {
             String cmd = Serial.readStringUntil('\n');
             cmd.trim();
-            
-            // Check for reboot command
-            if(cmd == "reset" || cmd == "reboot") ESP.restart(); 
-            
-            // Otherwise, process audio command
+            if(cmd == "reset" || cmd == "reboot") ESP.restart(); // Add soft reset here too
             parseCommand(cmd);
         }
     } else {
-        // [B] WIFI MODE BEHAVIOR
-        // 1. Maintain MQTT Connection
+        // --- 2. WIFI MODE ---
         if (!client.connected()) {
             static unsigned long lastReconnect = 0;
-            // Try to reconnect every 5 seconds if connection drops
             if (millis() - lastReconnect > 5000) {
                 reconnect();
                 lastReconnect = millis();
             }
         } else {
-            // Process incoming MQTT messages
             client.loop();
         }
 
-        // 2. Hot-Plug Listener (The "Emergency Exit")
-        // Even when running on WiFi, we listen to Serial. 
-        // If a user plugs in a laptop and types "menu", we reboot to give them control.
+        // --- HOT-PLUG LISTENER ---
+        // Even in WiFi mode, listen for a user plugging in USB.
+        // If they type "menu" or "reset", we reboot the board.
         if (Serial.available()) {
             String input = Serial.readStringUntil('\n');
             input.trim();
@@ -501,42 +515,30 @@ void loop() {
         }
     }
 
-    // --- SECTION 2: HIGH PRIORITY AUDIO ENGINE ---
-    
-    if (isPlaying) {
+    // --- 2. AUDIO PLAYBACK LOGIC ---
+    // Only run if playing AND SD is confirmed available
+    if (isPlaying && sdAvailable) {
         if (audioFile.available()) {
-            // 1. Read Raw Data
-            // Read a chunk of bytes from the SD card into our buffer
             size_t bytes_read = audioFile.read(i2s_buffer, sizeof(i2s_buffer));
             
-            // 2. Software Volume Processing
-            // We cast the buffer to 16-bit integers to manipulate audio samples
             int16_t* samples = (int16_t*)i2s_buffer;
-            int sampleCount = bytes_read / 2; // 16-bit = 2 bytes per sample
+            int sampleCount = bytes_read / 2; 
 
             for (int i = 0; i < sampleCount; i++) {
-                // Scale the audio sample by the volume float (0.0 to 1.0)
                 samples[i] = (int16_t)(samples[i] * masterVolume);
             }
 
-            // 3. Send to Hardware
-            // Push the processed buffer to the I2S amplifier
             size_t bytes_written;
             i2s_write(I2S_NUM_0, i2s_buffer, bytes_read, &bytes_written, 0); 
             
         } else {
-            // End of File (EOF) Reached
             if (shouldLoop) {
-                // If looping is active, jump back to byte 44 (skipping the WAV header)
                 audioFile.seek(44); 
             } else {
-                // If not looping, stop playback cleanly
                 stopPlayback();
             }
         }
     } else {
-        // If audio is idle, add a tiny delay to prevent the CPU from running hot
-        // This keeps the ESP32 cool and stable.
         delay(10); 
     }
 }
