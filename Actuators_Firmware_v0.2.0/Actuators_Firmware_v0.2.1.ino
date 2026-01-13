@@ -369,8 +369,7 @@ void setup() {
     
     WiFi.setSleep(false);
 
-    // --- FIX 1: TIMEOUT FOR SERIAL ---
-    // Instead of waiting forever, wait max 2000ms.
+    // wait 2s.
     // This allows the device to boot if plugged into a wall/battery.
     unsigned long serialStart = millis();
     while(!Serial && (millis() - serialStart < 2000)) { 
@@ -381,7 +380,7 @@ void setup() {
 
     Serial.println("\n\n=== SBS HAPTIC ACTUATOR START ===");
     
-    // --- 2. ROBUST SD CARD MOUNTING ---
+    // --- 2. SD CARD MOUNTING ---
     // We try 3 times to mount the SD card before proceeding.
     pinMode(SD_CS, OUTPUT);
     digitalWrite(SD_CS, HIGH); // Ensure CS is high (deselected) to reset state
@@ -464,6 +463,8 @@ void setup() {
         if (WiFi.status() == WL_CONNECTED) {
             Serial.println("\nWiFi Connected.");
             Serial.print("IP: "); Serial.println(WiFi.localIP());
+            Serial.print("MAC Address: ");
+            Serial.println(WiFi.macAddress());
             Serial.println("(Type 'menu' or 'reset' here to reboot into Manual Mode)");
             client.setServer(mqtt_server, 1883);
             client.setCallback(callback);
