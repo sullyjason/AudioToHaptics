@@ -1,6 +1,6 @@
 /*
 SBS Haptic Actuator Firmware 
-v0.2.0 - Robust SD & Non-Blocking Boot
+v0.2.1 - Robust SD & Non-Blocking Boot
 
 Compatible with Actuator_Dashboard.html v0.1.0
 
@@ -10,8 +10,7 @@ See hardware folder for details
 
 Capabilities:
  * 1. Hybrid Control: Works over WiFi (MQTT) OR USB (Serial).
- * 2. Audio Playback: Plays .wav files from SD card via I2S.
- * 3. Robust Boot: Retries SD card mounting and reports errors to dashboard without crashing.
+ * 2. Waveform file Playback: Plays .wav files from SD card via I2S.
 
 -----
 Created in 2025 by Silvan Jason Roth for Dr Jacqueline Borgstedt, SBS Lab, ETH Zürich
